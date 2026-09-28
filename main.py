@@ -5,11 +5,12 @@ from neo4j import GraphDatabase
 
 app = FastAPI(title="Harmoni Digital Twin Graph")
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j.railway.internal:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "12345678")
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+def get_db_driver():
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 @app.get("/api/graph-data")
 def get_graph_data():
@@ -26,6 +27,7 @@ def get_graph_data():
     LIMIT 350
     """
     try:
+        driver = get_db_driver()
         with driver.session() as session:
             result = session.run(query)
             nodes = {}
@@ -38,9 +40,10 @@ def get_graph_data():
                 if t_id not in nodes:
                     nodes[t_id] = {"id": t_id, "label": record["target_name"], "group": record["target_label"]}
                 links.append({"source": s_id, "target": t_id, "type": record["rel_type"]})
-            return {"nodes": list(nodes.values()), "links": links}
+        driver.close()
+        return {"nodes": list(nodes.values()), "links": links, "total_nodes": len(nodes)}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Neo4j Baglanti Hatasi: {str(e)}"}
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -56,7 +59,8 @@ def index():
             #header { display: flex; justify-content: space-between; align-items: center; background-color: #161b22; padding: 16px 24px; border-radius: 10px; border: 1px solid #30363d; }
             button { background-color: #238636; color: white; padding: 10px 18px; font-weight: 600; border-radius: 6px; border: none; cursor: pointer; transition: 0.2s; }
             button:hover { background-color: #2ea043; }
-            #network { width: 100%; height: 76vh; background-color: #161b22; border-radius: 10px; margin-top: 15px; border: 1px solid #30363d; }
+            #status-bar { margin-top: 10px; padding: 10px; border-radius: 6px; display: none; font-size: 13px; }
+            #network { width: 100%; height: 74vh; background-color: #161b22; border-radius: 10px; margin-top: 15px; border: 1px solid #30363d; }
             .legend { display: flex; gap: 14px; margin-top: 12px; font-size: 13px; flex-wrap: wrap; }
             .legend-item { display: flex; align-items: center; gap: 6px; }
             .badge { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
@@ -70,6 +74,8 @@ def index():
             </div>
             <button onclick="loadGraph()">Grafiği Yenile</button>
         </div>
+
+        <div id="status-bar"></div>
 
         <div class="legend">
             <div class="legend-item"><span class="badge" style="background:#ef4444;"></span> Deprem / Yayılım Zonu</div>
@@ -89,49 +95,67 @@ def index():
                     case 'CBRN_Event': return '#dc2626';
                     case 'CriticalInfrastructure': return '#f59e0b';
                     case 'District': case 'Neighbourhood': return '#10b981';
-                    case 'SoilClass': case 'FaultMode': case 'DepthBin': case 'SoilClassParent': case 'FaultModeParent': case 'DepthBinParent': case 'MagnitudeBinParent': case 'DurationBinParent': return '#8b5cf6';
+                    case 'SoilClass': case 'FaultMode': case 'DepthBin': case 'SoilClassParent': case 'FaultModeParent': return '#8b5cf6';
                     case 'InterventionPlan': case 'InterventionTask': case 'ResponseTeam': case 'ResponseRoute': case 'SafeZone': return '#ec4899';
                     default: return '#6b7280';
                 }
             }
 
             async function loadGraph() {
-                const res = await fetch('/api/graph-data');
-                const data = await res.json();
-                if(data.error) {
-                    alert('Hata: ' + data.error);
-                    return;
+                const statusDiv = document.getElementById('status-bar');
+                statusDiv.style.display = 'block';
+                statusDiv.style.backgroundColor = '#1f2937';
+                statusDiv.innerText = 'Veriler Neo4j veritabanından çekiliyor...';
+
+                try {
+                    const res = await fetch('/api/graph-data');
+                    const data = await res.json();
+                    
+                    if(data.error) {
+                        statusDiv.style.backgroundColor = '#7f1d1d';
+                        statusDiv.innerText = 'Hata: ' + data.error;
+                        return;
+                    }
+
+                    if(data.nodes.length === 0) {
+                        statusDiv.style.backgroundColor = '#78350f';
+                        statusDiv.innerText = 'Bağlantı başarılı ancak veritabanı şu an boş görünüyor (0 node). Neo4j Desktop üzerinden Cypher scriptini çalıştırdığından emin ol.';
+                        return;
+                    }
+
+                    statusDiv.style.backgroundColor = '#065f46';
+                    statusDiv.innerText = `Başarılı: ${data.nodes.length} düğüm ve ${data.links.length} ilişki yüklendi.`;
+
+                    const container = document.getElementById('network');
+                    const graphData = {
+                        nodes: new vis.DataSet(data.nodes.map(n => ({
+                            id: n.id,
+                            label: `${n.group}\\n(${n.label})`,
+                            color: { background: getColor(n.group), border: '#ffffff' },
+                            font: { color: '#ffffff', face: 'monospace', size: 11 },
+                            shape: 'box',
+                            margin: 8
+                        }))),
+                        edges: new vis.DataSet(data.links.map(l => ({
+                            from: l.source,
+                            to: l.target,
+                            label: l.type,
+                            font: { color: '#8b949e', size: 10, align: 'middle' },
+                            arrows: 'to',
+                            color: { color: '#30363d', highlight: '#58a6ff' }
+                        })))
+                    };
+
+                    const options = {
+                        physics: { stabilization: true, barnesHut: { springLength: 170, springConstant: 0.04, damping: 0.09 } },
+                        interaction: { hover: true, tooltipDelay: 150 }
+                    };
+
+                    new vis.Network(container, graphData, options);
+                } catch(err) {
+                    statusDiv.style.backgroundColor = '#7f1d1d';
+                    statusDiv.innerText = 'API isteği başarısız oldu: ' + err.message;
                 }
-
-                const container = document.getElementById('network');
-                const graphData = {
-                    nodes: new vis.DataSet(data.nodes.map(n => ({
-                        id: n.id,
-                        label: `${n.group}\\n(${n.label})`,
-                        color: { background: getColor(n.group), border: '#ffffff' },
-                        font: { color: '#ffffff', face: 'monospace', size: 11 },
-                        shape: 'box',
-                        margin: 8
-                    }))),
-                    edges: new vis.DataSet(data.links.map(l => ({
-                        from: l.source,
-                        to: l.target,
-                        label: l.type,
-                        font: { color: '#8b949e', size: 10, align: 'middle' },
-                        arrows: 'to',
-                        color: { color: '#30363d', highlight: '#58a6ff' }
-                    })))
-                };
-
-                const options = {
-                    physics: {
-                        stabilization: true,
-                        barnesHut: { springLength: 170, springConstant: 0.04, damping: 0.09 }
-                    },
-                    interaction: { hover: true, tooltipDelay: 150 }
-                };
-
-                new vis.Network(container, graphData, options);
             }
 
             window.onload = loadGraph;
